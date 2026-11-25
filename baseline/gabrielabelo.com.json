@@ -1,0 +1,36 @@
+{
+  "url": "https://gabrielabelo.com",
+  "created": "2026-11-25T19:08:31",
+  "checks": [
+    "contrast",
+    "offline",
+    "slow-first-paint",
+    "tap-targets"
+  ],
+  "findings": [
+    {
+      "fingerprint": "contrast|section#contact > div.panel-in > div > p:nth-of-type(#)",
+      "check": "contrast",
+      "sev": "med",
+      "msg": "2 text element(s) below WCAG AA contrast"
+    },
+    {
+      "fingerprint": "offline|no offline fallback - the page fails to open with the connection down (only matters if it should be a PWA)",
+      "check": "offline",
+      "sev": "low",
+      "msg": "no offline fallback - the page fails to open with the connection down (only matters if it should be a PWA)"
+    },
+    {
+      "fingerprint": "slow-first-paint|first content paint takes #.#s at #kbps (throttled #G)",
+      "check": "slow-first-paint",
+      "sev": "med",
+      "msg": "first content paint takes 3.3s at 400kbps (throttled 3G)"
+    },
+    {
+      "fingerprint": "tap-targets|html > body > nav.nav > div.nav-in > a.wordmark",
+      "check": "tap-targets",
+      "sev": "high",
+      "msg": "7 tap target(s) under 44x44 in the viewport, 7 under 32px"
+    }
+  ]
+}

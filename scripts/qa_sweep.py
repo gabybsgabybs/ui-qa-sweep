@@ -10,8 +10,13 @@ Usage:
     python3 qa_sweep.py ./index.html --out /tmp/qa --quick
     python3 qa_sweep.py https://example.com --viewports "iPhone 14,Pixel 7" --schemes dark
 
-Outputs: <out>/report.md, <out>/report.json, <out>/shots/*.png
-Exit code: 0 = no high-severity findings, 1 = high-severity findings,
+    # CI: save a baseline once, then fail only on what got worse
+    python3 qa_sweep.py https://example.com --out qa --save-baseline
+    python3 qa_sweep.py https://example.com --out qa --baseline qa/baseline.json --fail-on high
+
+Outputs: <out>/report.md, <out>/report.json, <out>/shots/*.png,
+         <out>/shots/elem/*.png (a crop of the offending element), <out>/baseline.json
+Exit code: 0 = nothing at or above --fail-on (default high), 1 = something was,
            2 = the page could not be loaded at all.
 """
 
@@ -20,6 +25,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import pathlib
 import sys
 import time
 import traceback
@@ -279,6 +286,42 @@ CHECK_JS = r"""
     add('med', 'fixed-overlay', 'a fixed element covers more than 60% of the screen', {data: {examples: bigFixed}});
   }
 
+  // 9. iOS zooms the whole page when a focused field's text is under 16px
+  const smallFields = [];
+  if (touch) {
+    for (const el of document.querySelectorAll('input:not([type=hidden]), select, textarea')) {
+      if (!visible(el)) continue;
+      const cs = getComputedStyle(el);
+      const size = parseFloat(cs.fontSize) || 16;
+      if (size < 16) {
+        smallFields.push({sel: path(el), size: Math.round(size * 10) / 10,
+                          text: (el.getAttribute('placeholder') || el.getAttribute('name') || el.type || '').slice(0, 40)});
+      }
+      if (smallFields.length >= 5) break;
+    }
+  }
+  if (smallFields.length) {
+    add('med', 'input-zoom', smallFields.length + ' field(s) under 16px text, which makes iOS zoom the page on focus',
+        {data: {examples: smallFields}});
+  }
+
+  // 10. interactive elements with no accessible name at all
+  const unnamed = [];
+  for (const el of document.querySelectorAll('a[href], button, [role=button]')) {
+    if (!visible(el)) continue;
+    const name = (el.getAttribute('aria-label') || el.getAttribute('title')
+                  || (el.innerText || '').trim() || '').trim();
+    if (name.length) continue;
+    const img = el.querySelector('img[alt]');
+    if (img && (img.getAttribute('alt') || '').trim().length) continue;
+    unnamed.push({sel: path(el), text: (el.outerHTML || '').slice(0, 80)});
+    if (unnamed.length >= 5) break;
+  }
+  if (unnamed.length) {
+    add('low', 'unnamed-control', unnamed.length + ' link(s)/button(s) with no accessible name',
+        {data: {examples: unnamed}});
+  }
+
   // informational: fixed bottom bars
   out.bottomBars = [];
   for (const el of document.querySelectorAll('body *')) {
@@ -309,6 +352,54 @@ ANCHOR_JS = r"""
   const links = [...new Set([...document.querySelectorAll('a[href^="#"]')]
     .map(a => a.getAttribute('href')).filter(h => h && h !== '#' && h.length > 1))];
   return {barH, links: links.slice(0, 3)};
+}
+"""
+
+# Motion that keeps running when the visitor asked for reduced motion.
+REDUCE_JS = r"""
+() => {
+  if (!document.getAnimations) return {count: 0, sample: []};
+  const running = document.getAnimations().filter((a) => {
+    if (a.playState !== 'running') return false;
+    const t = (a.effect && a.effect.getComputedTiming) ? a.effect.getComputedTiming() : {};
+    const infinite = t.iterations === Infinity || t.endTime === Infinity;
+    return infinite || (typeof t.duration === 'number' && t.duration >= 800);
+  });
+  return {
+    count: running.length,
+    sample: running.slice(0, 3).map((a) => {
+      const el = a.effect && a.effect.target;
+      if (!el || !el.tagName) return '?';
+      const cls = (typeof el.className === 'string' ? el.className : '').trim().split(/\s+/).filter(Boolean).slice(0, 2);
+      return el.tagName.toLowerCase() + (cls.length ? '.' + cls.join('.') : '');
+    }),
+  };
+}
+"""
+
+# Where focus goes on Tab, and whether the page shows it.
+FOCUS_JS = r"""
+() => {
+  const el = document.activeElement;
+  if (!el || el === document.body) return null;
+  const cs = getComputedStyle(el);
+  const r = el.getBoundingClientRect();
+  const outlineVisible = cs.outlineStyle !== 'none' && parseFloat(cs.outlineWidth) > 0;
+  const shadowVisible = !!cs.boxShadow && cs.boxShadow !== 'none';
+  const parts = [];
+  let node = el;
+  while (node && node.nodeType === 1 && parts.length < 4) {
+    let s = node.tagName.toLowerCase();
+    if (node.id) { s += '#' + node.id; parts.unshift(s); break; }
+    const cls = (typeof node.className === 'string' ? node.className : '').trim().split(/\s+/).filter(Boolean).slice(0, 2);
+    if (cls.length) s += '.' + cls.join('.');
+    parts.unshift(s);
+    node = node.parentElement;
+  }
+  return {sel: parts.join(' > '), tag: el.tagName.toLowerCase(),
+          text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 30),
+          outline: outlineVisible || shadowVisible,
+          top: Math.round(r.top), h: Math.round(r.height)};
 }
 """
 
@@ -354,6 +445,8 @@ try {
 } catch (e) {}
 """
 
+NO_SHOTS = False
+
 SEV_ORDER = {"high": 0, "med": 1, "low": 2}
 SEV_LABEL = {"high": "HIGH", "med": "MED", "low": "LOW"}
 
@@ -374,12 +467,14 @@ def normalise_url(target: str) -> str:
     return "https://" + target
 
 
-def run_once(browser, url, vp_name, scheme, net, shots_dir, mobile=True):
+def run_once(browser, url, vp_name, scheme, net, shots_dir, mobile=True, reduced=False):
     """One page load in one configuration. Returns a run record."""
     w, h = VIEWPORTS[vp_name][0], VIEWPORTS[vp_name][1]
     record = {
-        "viewport": vp_name, "width": w, "height": h, "scheme": scheme, "net": net,
+        "viewport": vp_name, "width": w, "height": h, "scheme": scheme,
+        "net": net + ("/reduced" if reduced else ""),
         "issues": [], "console": [], "failed_requests": [], "metrics": {}, "shot": None,
+        "reduced": reduced,
     }
     ctx_args = dict(
         viewport={"width": w, "height": h},
@@ -388,6 +483,8 @@ def run_once(browser, url, vp_name, scheme, net, shots_dir, mobile=True):
         has_touch=mobile,
         color_scheme=scheme,
     )
+    if reduced:
+        ctx_args["reduced_motion"] = "reduce"
     if mobile:
         ctx_args["user_agent"] = MOBILE_UA
     context = browser.new_context(**ctx_args)
@@ -434,6 +531,35 @@ def run_once(browser, url, vp_name, scheme, net, shots_dir, mobile=True):
         return record
 
     record["load_ms"] = int((time.time() - start) * 1000)
+
+    try:
+        record["resources"] = page.evaluate(
+            "() => { const e = performance.getEntriesByType('resource');"
+            " const nav = performance.getEntriesByType('navigation')[0];"
+            " let b = 0; for (const r of e) b += (r.transferSize || r.encodedBodySize || 0);"
+            " if (nav) b += (nav.transferSize || nav.encodedBodySize || 0);"
+            " return {count: e.length + 1, bytes: b}; }")
+        nbytes = record["resources"]["bytes"]
+        if net == "fast" and nbytes > 3_000_000:
+            record["issues"].append({"sev": "med", "check": "heavy-page",
+                                     "msg": "page transfers %.1f MB" % (nbytes / 1e6),
+                                     "data": {"bytes": nbytes, "requests": record["resources"]["count"]}})
+        elif net == "fast" and nbytes > 1_800_000:
+            record["issues"].append({"sev": "low", "check": "heavy-page",
+                                     "msg": "page transfers %.1f MB" % (nbytes / 1e6),
+                                     "data": {"bytes": nbytes, "requests": record["resources"]["count"]}})
+    except PWError:
+        pass
+
+    if reduced:
+        try:
+            mv = page.evaluate(REDUCE_JS)
+            if mv.get("count"):
+                record["issues"].append({"sev": "med", "check": "motion-reduced",
+                                         "msg": "%d animation(s) keep running with prefers-reduced-motion: reduce" % mv["count"],
+                                         "data": {"examples": [{"sel": x} for x in mv.get("sample", [])]}})
+        except PWError:
+            pass
 
     # scroll jump sampling: on-load repositioning is a classic mobile bug
     samples = []
@@ -544,6 +670,36 @@ def run_once(browser, url, vp_name, scheme, net, shots_dir, mobile=True):
                                  "msg": "%d network request(s) failed" % len(fails),
                                  "data": {"examples": fails[:5]}})
 
+    # crop the worst offending element so the report shows the bug, not the page
+    if not NO_SHOTS:
+        elem_dir = shots_dir / "elem"
+        taken = 0
+        for issue in record["issues"]:
+            if taken >= 3 or issue.get("sev") == "low":
+                continue
+            data = issue.get("data") or {}
+            ex = data.get("examples") or data.get("offenders") or []
+            sel = next((e.get("sel") for e in ex if isinstance(e, dict) and e.get("sel")), None)
+            if not sel:
+                continue
+            try:
+                box = page.locator(sel).first.bounding_box()
+                if not box or box["width"] < 2 or box["height"] < 2:
+                    continue
+                pad = 12
+                x = max(0, box["x"] - pad)
+                y = max(0, box["y"] - pad)
+                elem_dir.mkdir(parents=True, exist_ok=True)
+                fname = "elem_%s_%s_%s_%d.png" % (vp_name, scheme, net, taken + 1)
+                page.screenshot(path=str(elem_dir / fname),
+                                clip={"x": x, "y": y,
+                                      "width": max(2, min(box["width"] + pad * 2, w - x)),
+                                      "height": max(2, min(box["height"] + pad * 2, 4000))})
+                data["shot"] = "shots/elem/" + fname
+                taken += 1
+            except (PWError, ValueError):
+                continue
+
     shot_name = "%s_%s_%s.png" % (vp_name, scheme, net)
     try:
         height = page.evaluate("(document.scrollingElement||document.documentElement).scrollHeight")
@@ -557,6 +713,102 @@ def run_once(browser, url, vp_name, scheme, net, shots_dir, mobile=True):
 
     context.close()
     return record
+
+
+def focus_pass(browser, url, vp_name="desktop-1440", scheme="light", max_tabs=25):
+    """Tab through the page and record whether each stop shows where focus is."""
+    w, h = VIEWPORTS[vp_name][0], VIEWPORTS[vp_name][1]
+    context = browser.new_context(viewport={"width": w, "height": h}, color_scheme=scheme)
+    page = context.new_page()
+    stops = []
+    try:
+        page.goto(url, wait_until="load", timeout=45000)
+        time.sleep(0.4)
+        for _ in range(max_tabs):
+            page.keyboard.press("Tab")
+            time.sleep(0.12)
+            info = page.evaluate(FOCUS_JS)
+            if not info:
+                continue
+            if any(x["sel"] == info["sel"] for x in stops):
+                break  # focus has wrapped: the tab order is complete
+            stops.append(info)
+    except (PWError, PWTimeout):
+        pass
+    finally:
+        context.close()
+    issues = []
+    invisible = [x for x in stops if not x["outline"]]
+    if invisible:
+        issues.append({"sev": "med", "check": "focus-invisible",
+                       "msg": "%d of %d keyboard stops show no visible focus indicator" % (len(invisible), len(stops)),
+                       "data": {"examples": [{"sel": x["sel"], "text": x["text"]} for x in invisible[:5]]}})
+    hidden = [x for x in stops if x["top"] < 0 or x["h"] == 0]
+    if hidden:
+        issues.append({"sev": "low", "check": "focus-offscreen",
+                       "msg": "%d keyboard stop(s) land on something off-screen or collapsed" % len(hidden),
+                       "data": {"examples": [{"sel": x["sel"]} for x in hidden[:5]]}})
+    return {"viewport": vp_name, "scheme": scheme, "net": "fast", "kind": "keyboard",
+            "issues": issues, "console": [], "failed_requests": [], "metrics": {}, "shot": None,
+            "tabStops": len(stops)}
+
+
+def _norm(text):
+    return re.sub(r"[0-9]+", "#", (text or "").strip())
+
+
+def fingerprint(issue):
+    """Stable identity of a finding, so a baseline can tell new from pre-existing.
+
+    Built from the check and the shortest example selector with numbers folded
+    out, so it survives counts changing and a different viewport reporting the
+    same element first.
+    """
+    d = issue.get("data") or {}
+    sels = []
+    for key in ("examples", "offenders"):
+        for e in (d.get(key) or []):
+            if isinstance(e, dict):
+                sel = e.get("sel") or e.get("href") or ""
+                if sel:
+                    sels.append(_norm(sel))
+    if sels:
+        sel = min(sels, key=lambda x: (len(x), x))
+    else:
+        sel = _norm(issue.get("msg", ""))
+    return "%s|%s" % (issue.get("check", "?"), sel)
+
+
+def all_findings(records):
+    out = []
+    for r in records:
+        for i in r["issues"]:
+            out.append((fingerprint(i), i, r))
+    return out
+
+
+def load_baseline(path):
+    """Fingerprints and checks from an earlier run; empty set when unreadable."""
+    fps, checks = set(), set()
+    try:
+        data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return fps, checks
+    for f in data.get("findings", []):
+        if f.get("fingerprint"):
+            fps.add(f["fingerprint"])
+    checks = set(data.get("checks") or [f.get("check") for f in data.get("findings", []) if f.get("check")])
+    return fps, checks
+
+
+def write_baseline(out_dir, url, findings):
+    rows = [{"fingerprint": f["fingerprint"], "check": f["check"], "sev": f["sev"], "msg": f["msg"]}
+            for f in findings]
+    payload = {"url": url, "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+               "checks": sorted({f["check"] for f in findings}),
+               "findings": sorted(rows, key=lambda r: r["fingerprint"])}
+    (out_dir / "baseline.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return len(rows)
 
 
 def dedupe(records):
@@ -574,11 +826,13 @@ def dedupe(records):
                 g["msg"] = i["msg"]
                 g["data"] = i.get("data")
     out = list(grouped.values())
+    for g in out:
+        g["fingerprint"] = fingerprint(g)
     out.sort(key=lambda g: (SEV_ORDER[g["sev"]], -len(g["seen"])))
     return out
 
 
-def write_report(out_dir: Path, url: str, records, findings, args):
+def write_report(out_dir: Path, url: str, records, findings, args, new_fps=None, baseline_checks=None):
     lines = []
     highs = [f for f in findings if f["sev"] == "high"]
     lines.append("# UI QA sweep - %s" % url)
@@ -586,12 +840,23 @@ def write_report(out_dir: Path, url: str, records, findings, args):
     lines.append("Run: %s | %d configurations | %d finding(s), %d high severity"
                  % (time.strftime("%Y-%m-%d %H:%M"), len(records), len(findings), len(highs)))
     lines.append("")
+    if new_fps is not None:
+        gone = sorted((baseline_checks or set()) - {f["check"] for f in findings})
+        lines.append("**Compared to the baseline:** %d new finding(s), %d pre-existing, "
+                     "%d kind(s) of problem gone since the baseline." %
+                     (len(new_fps), len(findings) - len(new_fps), len(gone)))
+        for check in gone[:10]:
+            lines.append("- no longer reported: `%s`" % check)
+        lines.append("")
     lines.append("## Findings")
     lines.append("")
     if not findings:
         lines.append("No layout or interaction problems found across the matrix. Check the manual list at the end.")
     for f in findings:
-        lines.append("### [%s] %s" % (SEV_LABEL[f["sev"]], f["msg"]))
+        marker = ""
+        if new_fps is not None and f.get("fingerprint") in new_fps:
+            marker = "NEW. "
+        lines.append("### [%s] %s%s" % (SEV_LABEL[f["sev"]], marker, f["msg"]))
         lines.append("")
         lines.append("- seen in: %s" % ", ".join(f["seen"][:8]) + (" (+%d more)" % (len(f["seen"]) - 8)
                                                                   if len(f["seen"]) > 8 else ""))
@@ -622,16 +887,23 @@ def write_report(out_dir: Path, url: str, records, findings, args):
             lines.append("- scroll positions: %s" % ", ".join("y=%s@%ss" % (s["y"], s["t"]) for s in d.get("samples", [])))
         elif f["check"] == "layout-shift":
             lines.append("- CLS: %.3f" % d.get("cls", 0))
+        elif f["check"] == "heavy-page":
+            lines.append("- %d request(s), %.1f MB" % (d.get("requests", 0), d.get("bytes", 0) / 1e6))
+        if d.get("shot"):
+            lines.append("- crop: [%s](%s)" % (d["shot"].split("/")[-1], d["shot"]))
         lines.append("")
     lines.append("## Per-configuration metrics")
     lines.append("")
-    lines.append("| viewport | scheme | net | load ms | FCP ms | CLS | screenshot |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("| viewport | scheme | net | load ms | FCP ms | CLS | MB | requests | screenshot |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for r in records:
         m = r.get("metrics", {})
-        lines.append("| %s | %s | %s | %s | %s | %s | %s |" % (
+        res = r.get("resources") or {}
+        lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
             r["viewport"], r["scheme"], r["net"], r.get("load_ms", "-"),
             m.get("fcp", "-"), round(m.get("cls", 0), 3),
+            round(res.get("bytes", 0) / 1e6, 2) if res else "-",
+            res.get("count", "-") if res else "-",
             ("[%s](%s)" % (r["shot"].split("/")[-1], r["shot"])) if r.get("shot") else "-"))
     lines.append("")
     lines.append("## Still needs a human")
@@ -642,8 +914,13 @@ def write_report(out_dir: Path, url: str, records, findings, args):
     lines.append("- Visual taste: whether a layout that passes the checks is actually the design you wanted.")
     lines.append("")
     (out_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
-    (out_dir / "report.json").write_text(json.dumps({"url": url, "records": records,
-                                                     "findings": findings}, indent=2), encoding="utf-8")
+    for f in findings:
+        f["fingerprint"] = f.get("fingerprint") or fingerprint(f)
+    payload = {"url": url, "records": records, "findings": findings}
+    if new_fps is not None:
+        payload["compared_to_baseline"] = True
+        payload["new_findings"] = sorted(new_fps)
+    (out_dir / "report.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def main():
@@ -654,7 +931,16 @@ def main():
     ap.add_argument("--schemes", default="light,dark", help="light,dark")
     ap.add_argument("--quick", action="store_true", help="phones x light only, plus one slow-3G run")
     ap.add_argument("--no-shots", action="store_true", help="skip screenshots")
+    ap.add_argument("--fail-on", default="high", choices=["high", "med", "low", "none"],
+                    help="lowest severity that makes the run exit non-zero (default high)")
+    ap.add_argument("--baseline", default="", help="baseline.json from an earlier run: report what changed")
+    ap.add_argument("--save-baseline", action="store_true", help="write <out>/baseline.json for later comparison")
+    ap.add_argument("--no-focus", action="store_true", help="skip the keyboard focus pass")
+    ap.add_argument("--no-motion", action="store_true", help="skip the reduced-motion run")
     args = ap.parse_args()
+
+    global NO_SHOTS
+    NO_SHOTS = args.no_shots
 
     url = normalise_url(args.target)
     out_dir = Path(args.out).expanduser()
@@ -692,11 +978,31 @@ def main():
             if "iPhone14-390" in names:
                 print("  iPhone14-390 / light / offline", flush=True)
                 records.append(run_once(browser, url, "iPhone14-390", "light", "offline", shots_dir, True))
+            if "iPhone14-390" in names and not args.no_motion:
+                print("  iPhone14-390 / reduce-motion", flush=True)
+                records.append(run_once(browser, url, "iPhone14-390", "light", "fast", shots_dir, True, reduced=True))
+            if not args.no_focus:
+                print("  desktop-1440 / keyboard", flush=True)
+                records.append(focus_pass(browser, url))
         finally:
             browser.close()
 
     findings = dedupe(records)
-    write_report(out_dir, url, records, findings, args)
+
+    baseline_fps, baseline_checks = load_baseline(args.baseline) if args.baseline else (None, None)
+    new_fps = None
+    if baseline_fps is not None:
+        current = {f["fingerprint"] for f in findings}
+        new_fps = current - baseline_fps
+        # findings are shown newest first so a regression is the first thing read
+        findings.sort(key=lambda g: (0 if g.get("fingerprint") in new_fps else 1,
+                                     SEV_ORDER[g["sev"]], -len(g["seen"])))
+
+    write_report(out_dir, url, records, findings, args, new_fps=new_fps, baseline_checks=baseline_checks)
+
+    if args.save_baseline:
+        n = write_baseline(out_dir, url, findings)
+        print("baseline written: %s (%d findings)" % (out_dir / "baseline.json", n))
 
     if records and all(any(i["check"] in ("load-failed", "timeout") for i in r["issues"])
                        for r in records):
@@ -707,9 +1013,19 @@ def main():
     print("UI sweep: %d configurations, %d finding(s) - %d high" %
           (len(records), len(findings), len([f for f in findings if f["sev"] == "high"])))
     for f in findings[:10]:
-        print("  [%s] %s (%s)" % (SEV_LABEL[f["sev"]], f["msg"], ", ".join(f["seen"][:3])))
+        tag = "NEW " if (new_fps is not None and f.get("fingerprint") in new_fps) else ""
+        print("  [%s] %s%s (%s)" % (SEV_LABEL[f["sev"]], tag, f["msg"], ", ".join(f["seen"][:3])))
+    if new_fps is not None:
+        print("compared to baseline: %d new, %d pre-existing" % (len(new_fps), len(findings) - len(new_fps)))
     print("report: %s" % (out_dir / "report.md"))
-    return 1 if any(f["sev"] == "high" for f in findings) else 0
+
+    if args.fail_on == "none":
+        return 0
+    bar = SEV_ORDER[args.fail_on]
+    gated = [f for f in findings if SEV_ORDER[f["sev"]] <= bar]
+    if new_fps is not None:
+        gated = [f for f in gated if f.get("fingerprint") in new_fps]
+    return 1 if gated else 0
 
 
 if __name__ == "__main__":

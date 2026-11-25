@@ -1,0 +1,65 @@
+name: UI QA sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Page to sweep
+        required: false
+        default: https://gabrielabelo.com
+      quick:
+        description: Quick matrix (phones + one slow-3G run)
+        type: boolean
+        default: true
+  schedule:
+    - cron: "0 13 * * 1"   # Mondays, 13:00 UTC
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright and Chromium
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Sweep
+        id: sweep
+        env:
+          URL: ${{ inputs.url || 'https://gabrielabelo.com' }}
+        run: |
+          set +e
+          QUICK=""
+          if [ "${{ inputs.quick }}" != "false" ]; then QUICK="--quick"; fi
+          BASE=""
+          HOST=$(python -c "import os,urllib.parse;print(urllib.parse.urlparse(os.environ['URL']).netloc)")
+          if [ -f "baseline/$HOST.json" ]; then BASE="--baseline baseline/$HOST.json"; fi
+          python scripts/qa_sweep.py "$URL" --out qa $QUICK $BASE --fail-on high
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Put the report on the run page
+        if: always()
+        run: |
+          if [ -f qa/report.md ]; then cat qa/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload the report and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-qa-report
+          path: qa/
+          if-no-files-found: warn
+
+      - name: Fail the job on a regression
+        if: steps.sweep.outputs.code == '1'
+        run: |
+          echo "New finding at or above the failure bar. See the job summary and the ui-qa-report artifact."
+          exit 1

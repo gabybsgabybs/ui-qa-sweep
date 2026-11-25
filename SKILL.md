@@ -29,12 +29,21 @@ python3 scripts/qa_sweep.py https://example.com --out /tmp/qa
 python3 scripts/qa_sweep.py ./index.html --out /tmp/qa        # local file works
 python3 scripts/qa_sweep.py https://example.com --out /tmp/qa --quick   # phones only, ~1 min
 python3 scripts/qa_sweep.py https://example.com --out /tmp/qa --viewports "iPhone14-390,pixel7-412" --schemes dark
+
+# CI: save a baseline once, then fail only on regressions
+python3 scripts/qa_sweep.py https://example.com --out qa --save-baseline
+python3 scripts/qa_sweep.py https://example.com --out qa --baseline qa/baseline.json --fail-on high
 ```
 
-Read `<out>/report.md` (ranked findings, each with the viewport it appears in and
-the offending element), `<out>/report.json` (same, machine-readable) and
-`<out>/shots/*.png` (one screenshot per configuration). Exit code is 1 when
-something high-severity was found, 0 when clean, 2 when the page never loaded.
+Read `<out>/report.md` (ranked findings, each with the viewport it appears in, the
+offending element and a crop of it), `<out>/report.json` (same, machine-readable,
+with a fingerprint per finding) and `<out>/shots/*.png` (one screenshot per
+configuration, plus `shots/elem/` crops).
+
+Exit code: 1 when a finding at or above `--fail-on` (default `high`) was found,
+0 when clean, 2 when the page never loaded. With `--baseline`, only findings that
+are new or changed count against the exit code; the report marks them `NEW`,
+lists pre-existing ones under them and names the ones that disappeared.
 
 Requires Playwright (`pip install playwright`) and a Chrome/Chromium binary; the
 script finds `/usr/bin/google-chrome` or falls back to Playwright's own Chromium.
@@ -47,8 +56,11 @@ script finds `/usr/bin/google-chrome` or falls back to Playwright's own Chromium
 | Tablet / desktop | 768x1024 (iPad mini), 1440x900 |
 | Colour scheme | light and dark (`prefers-color-scheme`), every viewport |
 | Network | fast, 400kbps + 350ms latency with 4x CPU throttle (slow 3G), offline |
+| Preferences | `prefers-reduced-motion: reduce`, keyboard-only tab order (desktop) |
 
 `--quick` keeps the three phones x light plus one slow-3G and one offline run.
+`--no-focus` and `--no-motion` drop the keyboard pass and the reduced-motion run
+when a fast answer matters more than the coverage.
 The full matrix takes 2-3 minutes; `--quick` about one.
 
 For the site this was built from (gabrielabelo.com), sweep the live URL or the
@@ -81,13 +93,33 @@ deployed URL after Pages updates.
     4xx-5xx.
 11. **Slow 3G interactivity** - can the page still scroll while assets are still
     arriving.
+12. **Form field text under 16px** - the reason iOS zooms the whole page when a
+    field is focused.
+13. **Controls with no accessible name** - icon-only links and buttons.
+14. **Keyboard focus** - tabs through the page and reports stops with no visible
+    focus indicator.
+15. **Reduced motion** - animations that keep looping when the visitor asked for
+    `prefers-reduced-motion: reduce`.
+16. **Page weight** - transferred bytes and request count, both from resource
+    timing (the document itself included).
+
+## Use it as a gate, not a report
+
+The first sweep of an existing site reports everything that was already there.
+Save a baseline once, then compare on every change and fail only on what got
+worse. In a repository, keep the baseline next to the code (`baseline/<host>.json`)
+and run the sweep in CI; `.github/workflows/ui-qa.yml` is a working example that
+puts the report in the run summary and the screenshots in an artifact.
+
+Re-save the baseline only after a human has seen the site on a phone.
 
 ## How to work a report
 
-1. Start with the HIGH findings that appear in the most configurations - those
-   are the ones that hit real phones.
-2. Open the screenshot for the viewport named in the finding before changing
-   code; the element path in the finding tells you what to inspect.
+1. With a baseline, start with the `NEW` findings - those are the ones this
+   change introduced. Otherwise start with the HIGH findings that appear in the
+   most configurations; those are the ones that hit real phones.
+2. Open the crop (`shots/elem/`) or the screenshot for the viewport named in the
+   finding before changing code; the element path tells you what to inspect.
 3. Fix, then re-run only that configuration
    (`--viewports "iPhone14-390" --schemes light`) while iterating, and the full
    matrix once before saying it is done.
